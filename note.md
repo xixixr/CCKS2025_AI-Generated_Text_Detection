@@ -1,0 +1,67 @@
+# 不同方法测试记录
+# 一. SuperAnnotate/ai-detector (bert_based finetuning)
+## 环境配置
+```shell
+# 创建conda 环境
+conda create -n xxx python=3.11
+conda init
+conda activate xxx
+# 安装superAnnotate所需环境(换源阿里云)
+pip install git+https://github.com/superannotateai/generated_text_detector.git@v1.1.0 -i https://mirrors.aliyun.com/pypi/simple/
+pip install -r requirements.txt
+# 测试torch
+print(torch.cuda.is_available())
+# 安装torch(可选)
+pip install torch==2.2.1+cu118  torchaudio==2.2.1+cu118  torchvision==0.17.1+cu118 -i https://mirrors.aliyun.com/pytorch-wheels/
+
+```
+## 解释
+使用hf模型SuperAnnotate/ai-detector进行微调得到检测结果
+### config&&result
+|idx |batch_size |lr  |scheduler|epoch |accumulation_steps|loss|acc_local_val |threshold| acc
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|1|1|5e-5|linear_schedule_with_warmup|5|1|sigmoid+交叉熵|---|0.5|0.5084|
+|2|1|1e-5|linear_schedule_with_warmup|1|16|sigmoid+交叉熵|0.9546|0.5195|---|
+|3|2|2e-5|linear_schedule_with_warmup|1|8|sigmoid+交叉熵|0.9832|0.5195|0.6541|
+|4|16|1e-5|None|1|1|sigmoid+交叉熵|0.9743|0.5195|0.6419|
+|5|16|1e-5|None|1|1|MSE|0.9703|0.7995|0.7619|
+|6|16|1e-5|None|1|1|MSE|0.9703|0.82|---|
+# 二.使用大模型进行微调
+## llama-factory的使用方法
+### llama-factory环境配置
+[llama_factory项目链接](https://github.com/hiyouga/LLaMA-Factory)
+```shell
+conda create -n llama_factory python=3.11
+git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
+cd LLaMA-Factory
+conda activate llama_factory
+pip install -e ".[torch,metrics]"
+```
+### llama-factory数据预处理
+可以参照[说明文档](https://llamafactory.readthedocs.io/zh-cn/latest/index.html)的预处理方法进行自制数据集，同时将数据集注册到data_info.json文件中，同时按照指定的训练方式，配置训练的配置文件
+
+
+
+## sft + lora微调  
+### 实验配置及记录
+|method|promt| acc
+|:---:|:---:|:---:|
+|llama factory|output:AI-generated/Human-generated|0.7194|
+|llama factory|output:AI/Human|0.7647|
+## 将模型作为特征提取器然后做回归任务
+### 使用qwen0.5-0.5B-instruct
+default lora config
+```python
+ lora_config = LoraConfig(r=8, 
+ lora_alpha=8, 
+ target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"],
+  bias = "none", 
+  task_type= TaskType.FEATURE_EXTRACTION
+)
+ ```
+|idx |batch_size |lr  |lora config|epoch |scheduler|loss|threshold| acc|note
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|0.8682|使用last token的hidden_state|
+|2|8|5e-5|all|1|cosine_schedule_with_warmup|MSE|0.5|0.7086||
+|3|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.6|0.8864|使用last token的hidden_state|
+
