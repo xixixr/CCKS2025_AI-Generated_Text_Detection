@@ -50,6 +50,7 @@ pip install -e ".[torch,metrics]"
 |llama factory|output:AI/Human|0.7647|
 ## 将模型作为特征提取器然后做回归任务
 ### 使用qwen0.5-0.5B-instruct
+#### A榜
 default lora config
 ```python
  lora_config = LoraConfig(r=8, 
@@ -64,4 +65,9 @@ default lora config
 |1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|0.8682|使用last token的hidden_state|
 |2|8|5e-5|all|1|cosine_schedule_with_warmup|MSE|0.5|0.7086||
 |3|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.6|0.8864|使用last token的hidden_state|
+#### B榜
 
+|idx |batch_size |lr  |lora config|epoch |scheduler|loss|threshold| acc|note
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.4905|0.6958|使用last token的hidden_state 数据加入prompt|
+|2|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|0.7463|使用last token的hidden_state|

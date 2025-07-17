@@ -184,10 +184,10 @@ for batch in process_bar:
             attention_mask=torch.tensor(attention_mask).to(device)
         )
     predictions.extend(preds.view(-1).tolist())
-output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_A/submit.txt"
+output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.6: #0.513
+        if pred >= 0.513: #0.513
             f.write("1\n")
         else:
             f.write("0\n")
