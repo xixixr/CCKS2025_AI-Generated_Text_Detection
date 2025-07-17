@@ -3,45 +3,67 @@ from transformers import AutoModel, AutoTokenizer
 import torch
 import torch.nn as nn
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from peft import PeftModel
 from torch.utils.data import DataLoader
+from typing import Optional
+
+mean_pooling=False
+
 class CustomModel(nn.Module):
-    def __init__(self, model_name, num_labels):
+    def __init__(self, model_name, num_labels,mean_pooling=False):
         super().__init__()
-        self.base_model = AutoModel.from_pretrained(model_name, local_files_only=True)
+        self.num_labels = num_labels
+        self.mean_pooling = mean_pooling
+        self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
         self.hidden_size = self.base_model.config.hidden_size
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = self.base_model.config.bos_token_id
-        self.regression_head = nn.Linear(self.hidden_size, num_labels)
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
-        output = self.base_model(input_ids=input_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds)
-        hidden_states = output.last_hidden_state
+        self.regression_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.SiLU(),             # 与主模型激活一致
+            nn.Dropout(0.1),       # 防过拟合
+            nn.Linear(self.hidden_size // 2, self.num_labels)
+            )
+    def forward(self,
+                input_ids: Optional[torch.LongTensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None):
+
+            
+        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds)
+        hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
+        if self.mean_pooling:
+            masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+            pooled_output = masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1) #(batch_size,hidden_size)
+            logits = self.regression_head(pooled_output) #(batch_size,num_labels)
+            return logits
+        # find the last token hidden state
         if input_ids is not None:
             batch_size = input_ids.shape[0]
-            last_token_mask = (input_ids != self.pad_token_id) #(batch_size, sequence_length)
+            non_pad_mask = (input_ids != self.pad_token_id) # (batch_size,seq_len)
         else:
             batch_size = inputs_embeds.shape[0]
-            last_token_mask = (inputs_embeds != 0).any(dim=-1)
+            non_pad_mask = attention_mask.bool()
         if input_ids is None and attention_mask is None:
             raise ValueError("At least one of input_ids or attention_mask must be provided.")
-        torch_indices = torch.arange(input_ids.shape[-1], device=input_ids.device)  # (sequence_length)
-        last_non_pad_token = (torch_indices * last_token_mask).argmax(dim=-1)  # (batch_size)
-        last_token_hidden_states = hidden_states[torch.arange(batch_size), last_non_pad_token]  # (batch_size, hidden_size)
-        logits = self.regression_head(last_token_hidden_states)  # (batch_size, num_labels)
+        token_indices = torch.arange(input_ids.shape[-1],device=input_ids.device) # (seq_len)
+        last_non_pad_token = (token_indices*non_pad_mask).argmax(dim = -1) #(batch_size)
+        last_token_hidden_states = hidden_states[torch.arange(batch_size),last_non_pad_token] # (batch_size,hidden_size)
+        logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
 
 # 载入模型
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
-model = CustomModel(model_name, num_labels=1)
+model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling)
 
 
-adapter_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/lora"
+adapter_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update/lora"
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
 
-regression_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora"
+regression_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update"
 regression_state = torch.load(os.path.join(regression_path, "regression_head.pth"))
 model.regression_head.load_state_dict(regression_state)
 # 检查模型是否加载成功
@@ -58,9 +80,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, tru
 # 加载数据集
 import datasets
 train_data_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/train.jsonl"
-test_data_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/test.jsonl"
 train_data = datasets.load_dataset("json", data_files={"train": train_data_path}, num_proc=8)["train"]
-test_data = datasets.load_dataset("json", data_files={"test": test_data_path}, num_proc=8)["test"]
 def map_function(example):
     model_input = tokenizer(
         example["text"],
@@ -74,7 +94,7 @@ def map_function(example):
 
 train_data = train_data.map(map_function,num_proc=8 ,remove_columns=["text"])
 from tqdm import tqdm
-batch_size = 16
+batch_size = 8
 
 def create_collate_fn(tokenizer):
     def collate_fn(batch):
@@ -168,10 +188,10 @@ def create_collate_fn(tokenizer):
     return collate_fn
 batch_size = 8
 test_data_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/test.jsonl"
-test_data = datasets.load_dataset("json", data_files={"test": test_data_path}, num_proc=8)["test"]
+test_data = datasets.load_dataset("json", data_files={"test": test_data_path}, num_proc=4)["test"]
 test_data = test_data.map(map_function,num_proc=8 ,remove_columns=["text"])
 collate_fn = create_collate_fn(tokenizer)
-test_loader = DataLoader(test_data,batch_size = batch_size,shuffle = False,num_workers = 8,collate_fn=collate_fn)
+test_loader = DataLoader(test_data,batch_size = batch_size,shuffle = False,num_workers =4,collate_fn=collate_fn)
 predictions = []
 from tqdm import tqdm
 process_bar = tqdm(test_loader)
@@ -187,7 +207,7 @@ for batch in process_bar:
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.513: #0.513
+        if pred >= 0.612:
             f.write("1\n")
         else:
             f.write("0\n")

@@ -23,30 +23,25 @@ def parse_args():
     parser.add_argument("--learning_rate",type=float,default=5e-5,help="Learning rate")
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
+    parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
+    parser.add_argument("--model_name_or_path", 
+                        type=str, 
+                        default="/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct", 
+                        help="Pretrained model path")
+    parser.add_argument("--train_file", type=str, 
+                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/train.jsonl", 
+                        help="Path to training file")
+    parser.add_argument("--val_file", 
+                        type=str, 
+                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/val.jsonl", 
+                        help="Path to validation file")
+    parser.add_argument("--output_dir", 
+                        type=str, 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update/", 
+                        help="Directory to save model outputs")
     return parser.parse_args()
+args = parse_args()
 
-
-class TextDataset(Dataset):
-    def __init__(self,train_data,tokenizer):
-        super().__init__()
-        self.texts = train_data["text"]
-        self.tokenizer = tokenizer
-        self.labels = train_data["label"]
-    def __len__(self):
-        return len(self.texts)
-    def __getitem__(self, index):
-        model_input = self.tokenizer(
-            self.texts[index],
-            add_special_tokens = True,
-            # padding = True,
-            # return_tensors = "pt" # 为了之后的batch处理能够得到正确的padding,返回list[int],而不是batchtensor
-            )
-        return {
-            "input_ids": model_input["input_ids"],
-            "attention_mask": model_input["attention_mask"],
-            "label": self.labels[index] 
-        }
-        
 def create_collate_fn(tokenizer):
     def collate_fn(batch):
         # 将 input_ids 和 attention_mask 提取出来作为字典列表
@@ -70,21 +65,35 @@ def create_collate_fn(tokenizer):
     return collate_fn
 
 class CustomModel(nn.Module):
-    def __init__(self, model_name, num_labels):
+    def __init__(self, model_name, num_labels,mean_pooling):
         super().__init__()
         self.num_labels = num_labels
+        self.mean_pooling = mean_pooling
         self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
         self.hidden_size = self.base_model.config.hidden_size
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = self.base_model.config.bos_token_id
-        self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
+        self.regression_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.SiLU(),             # 与主模型激活一致
+            nn.Dropout(0.1),       # 防过拟合
+            nn.Linear(self.hidden_size // 2, self.num_labels)
+            )
+        # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
     def forward(self,
                 input_ids: Optional[torch.LongTensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None):
+
+            
         output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds)
-        hidden_states = output.last_hidden_state
+        hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
+        if self.mean_pooling:
+            masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+            pooled_output = masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1) #(batch_size,hidden_size)
+            logits = self.regression_head(pooled_output) #(batch_size,num_labels)
+            return logits
         # find the last token hidden state
         if input_ids is not None:
             batch_size = input_ids.shape[0]
@@ -100,9 +109,31 @@ class CustomModel(nn.Module):
         logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
     
+def evaluate(model,val_loader,writer,epoch):
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad():
+        for batch in tqdm(val_loader,desc="Evaluating"):
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
+            with torch.cuda.amp.autocast():
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = F.mse_loss(logits.view(-1), labels.float().view(-1))
+            writer.add_scalar("val/loss", loss.item(), epoch)
+            total_loss += loss.item()
+            num_batches += 1
+    avg_loss = total_loss / num_batches
+    
+    return avg_loss   
+
+        
 # 训练循环
-def train(data_iterator,model,optimizer,scheduler,epochs,writer):
+def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader):
     model.train()
+    train_total_loss = 0
+    batches = 0
     for epoch in range(epochs):
         process_bar  = tqdm(data_iterator, desc=f"Epoch {epoch + 1}/{epochs}")
         for batch in process_bar:
@@ -120,20 +151,26 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer):
             writer.add_scalar("train/loss", loss.item(), epoch * len(data_iterator) + process_bar.n)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch * len(data_iterator) + process_bar.n)
             process_bar.set_postfix({"loss": loss.item()})
+            train_total_loss += loss.item()
+            batches += 1
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
+        val_loss = evaluate(model, val_loader, writer, epoch)
+        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
+        print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
+        model.train()
     writer.close()  # 关闭TensorBoard记录器    
             
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-    args = parse_args()
-    log_dir = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/logs"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    
+    log_dir = args.output_dir + "/logs"
     os.makedirs(log_dir, exist_ok=True)
     # 设置TensorBoard日志记录器
     writer = SummaryWriter(log_dir=log_dir)  # TensorBoard日志目录
     # 加载模型和分词器
-    model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
+    model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name,local_files_only=True,trust_remote_code=True,padding_side="left")
-    model = CustomModel(model_name,args.num_labels)
+    model = CustomModel(model_name,args.num_labels,args.mean_pooling)
     
     lora_config = LoraConfig(
         r=8,  # LoRA rank
@@ -156,8 +193,11 @@ if __name__ == "__main__":
 
 
     # 加载数据集
-    train_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/train.jsonl"
-    train_data = datasets.load_dataset("json",data_files={"train":train_path})["train"]
+    train_path = args.train_file
+    val_path = args.val_file
+    data = datasets.load_dataset("json",data_files={"train":train_path,"val":val_path},num_proc=4)
+    train_data = data["train"]
+    val_data = data["val"]
     # dataset = TextDataset(train_data,tokenizer)
     # 优化方案
     def map_function(example):
@@ -173,16 +213,24 @@ if __name__ == "__main__":
             "attention_mask": model_input["attention_mask"],
             "label": example["label"]
         }
-    dataset = train_data.map(
+    train_dataset = train_data.map(
         map_function,
         remove_columns=["text"],  # 移除原始文本列
-        num_proc=8,  # 使用8个进程进行并行处理
+        num_proc=4,  # 使用8个进程进行并行处理
         desc="Processing train data"
     )
     
     collate_fn = create_collate_fn(tokenizer)
-    train_loader = DataLoader(dataset,batch_size=args.batch_size,shuffle = True,num_workers = 8,collate_fn=collate_fn)
-    print(f"Dataset size: {len(train_loader)}, Finish loading dataset")
+    train_loader = DataLoader(train_dataset,batch_size=args.batch_size,shuffle = True,num_workers = 4,collate_fn=collate_fn)
+    val_dataset = val_data.map(
+    map_function,
+    remove_columns=["text"],
+    num_proc=4,
+    desc="Processing val data"
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+
+    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
     
     
     
@@ -192,26 +240,24 @@ if __name__ == "__main__":
     
     # 使用Accelerator进行分布式训练
     from accelerate import Accelerator
-    accelerator = Accelerator()
-    model,optimizer,train_loader = accelerator.prepare(model,optimizer,train_loader)
+    accelerator = Accelerator(mixed_precision="fp16")
+    model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+
     
     from transformers.optimization import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=int(0.1*total_step*args.epochs),num_training_steps=total_step*args.epochs)
     print("Finish preparing optimizer and scheduler")
     # 开始训练
     print("Start training...")
-    train(train_loader,model,optimizer,scheduler,args.epochs,writer)
+    train(train_loader,model,optimizer,scheduler,args.epochs,writer, val_loader)
     
     # 保存
-    save_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora"
-    os.makedirs(save_path, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     # 保存LoRA adapter
-    model.base_model.save_pretrained(os.path.join(save_path, "lora"))
+    model.base_model.save_pretrained(os.path.join(args.output_dir, "lora"))
 
     # 保存regression_head参数
-    torch.save(model.regression_head.state_dict(), os.path.join(save_path, "regression_head.pth"))
+    torch.save(model.regression_head.state_dict(), os.path.join(args.output_dir, "regression_head.pth"))
 
-    # 保存tokenizer
-    tokenizer.save_pretrained(save_path)
 
 

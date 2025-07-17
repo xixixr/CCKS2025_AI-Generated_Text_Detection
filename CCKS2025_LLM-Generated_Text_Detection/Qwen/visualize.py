@@ -16,7 +16,7 @@ if __name__ == "__main__":
     # 绘制分布图，横坐标probability，纵坐标为个数，不同样本参照label进行区分
     results_train['label'] = labels
     results_train['probability'] = probabilities
-    max_F1,max_p =0,0
+    max_F1,max_p =0,[]
     prediction = []
     for p in tqdm(np.arange(0,1,0.0005)):
         predictions = [int(i>=p) for i in probabilities]
@@ -29,11 +29,14 @@ if __name__ == "__main__":
         precision = TP/(TP+FP)
         recall = TP/(TP+FN)
         F1 = 2*precision*recall/(precision+recall)
-        if F1>=max_F1:
+        if F1>max_F1:
             max_F1 = F1
-            max_p = p
+            max_p = []
+            max_p.append(p)
+        elif F1 == max_F1:
+            max_p.append(p)
     # 打印最大的F1和p
-    print(f"max F1 score:{max_F1} , p:{max_p}\n")
+    print(f"max F1 score:{max_F1} , p:{min(max_p),max(max_p)}\n")
 
     # # 绘制概率分布图
     plt.figure(figsize=(10, 6))

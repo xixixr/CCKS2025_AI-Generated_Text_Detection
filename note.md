@@ -67,7 +67,9 @@ default lora config
 |3|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.6|0.8864|使用last token的hidden_state|
 #### B榜
 
-|idx |batch_size |lr  |lora config|epoch |scheduler|loss|threshold| acc|note
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.4905|0.6958|使用last token的hidden_state 数据加入prompt|
-|2|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|0.7463|使用last token的hidden_state|
+|idx |batch_size |lr  |lora config|epoch |scheduler|loss|threshold|train/val loss| acc|note
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.4905|-|0.6958|使用last token的hidden_state 数据加入prompt|
+|2|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|-|0.7463|使用last token的hidden_state|
+|3|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|-|0.7343|使用最后一层数据的mean_pooling|
+|4|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.612|-|0.7776|将regression_head 增加一层提升表达能力|
