@@ -72,4 +72,5 @@ default lora config
 |1|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.4905|-|0.6958|使用last token的hidden_state 数据加入prompt|
 |2|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|-|0.7463|使用last token的hidden_state|
 |3|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.513|-|0.7343|使用最后一层数据的mean_pooling|
-|4|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.612|-|0.7776|将regression_head 增加一层提升表达能力|
+|4|8|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.612|0.025/0.003|0.7776|将regression_head 增加一层提升表达能力|
+|5|8|5e-5|dropput = 0.1|1|cosine_schedule_with_warmup|MSE|0.|0.0622/0.0052|0.8185|regression_head update + concat_layers|

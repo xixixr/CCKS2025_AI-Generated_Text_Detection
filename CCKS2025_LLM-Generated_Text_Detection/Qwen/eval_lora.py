@@ -9,34 +9,42 @@ from torch.utils.data import DataLoader
 from typing import Optional
 
 mean_pooling=False
-
+concat_layers = [6,12,-1]
 class CustomModel(nn.Module):
-    def __init__(self, model_name, num_labels,mean_pooling=False):
+    def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
         super().__init__()
         self.num_labels = num_labels
         self.mean_pooling = mean_pooling
+        self.concat_layers = concat_layers
         self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
         self.hidden_size = self.base_model.config.hidden_size
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = self.base_model.config.bos_token_id
+        output_len = len(self.concat_layers)*self.hidden_size
         self.regression_head = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
             nn.Dropout(0.1),       # 防过拟合
-            nn.Linear(self.hidden_size // 2, self.num_labels)
+            nn.Linear(output_len // 2, self.num_labels)
             )
+        # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
     def forward(self,
                 input_ids: Optional[torch.LongTensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None):
 
-            
-        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds)
+        
+        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds,output_hidden_states = True)
+        hidden_states = output.hidden_states
+        selected_states = [hidden_states[i] for i in self.concat_layers] # list consist of (batch_size,seq_len,hidden_size)
         hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
         if self.mean_pooling:
-            masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
-            pooled_output = masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1) #(batch_size,hidden_size)
+            pooled_output = []
+            for hidden_states in selected_states:
+                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+                pooled_output.append(masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)) # list of (batch_size,hidden_size)
+            pooled_output = torch.cat(pooled_output,dim=-1) #(batch_size,hidden_size*len(self.concat_layers))
             logits = self.regression_head(pooled_output) #(batch_size,num_labels)
             return logits
         # find the last token hidden state
@@ -48,22 +56,28 @@ class CustomModel(nn.Module):
             non_pad_mask = attention_mask.bool()
         if input_ids is None and attention_mask is None:
             raise ValueError("At least one of input_ids or attention_mask must be provided.")
-        token_indices = torch.arange(input_ids.shape[-1],device=input_ids.device) # (seq_len)
+        seq_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+        token_indices = torch.arange(seq_len,device=input_ids.device) # (seq_len)
         last_non_pad_token = (token_indices*non_pad_mask).argmax(dim = -1) #(batch_size)
-        last_token_hidden_states = hidden_states[torch.arange(batch_size),last_non_pad_token] # (batch_size,hidden_size)
+        last_token_hidden_states = []
+        for hidden_states in selected_states:
+            if hidden_states.shape[1] <= last_non_pad_token.max():
+                raise ValueError("The last non-pad token index exceeds the sequence length of the hidden states.")
+            last_token_hidden_states.append(hidden_states[torch.arange(batch_size),last_non_pad_token])  # list of (batch_size,hidden_size)
+        last_token_hidden_states = torch.cat(last_token_hidden_states,dim=-1) # (batch_size,hidden_size*len(self.concat_layers))
         logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
-
+    
 # 载入模型
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
-model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling)
+model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
 
 
-adapter_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update/lora"
+adapter_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers/lora"
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
 
-regression_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update"
+regression_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers"
 regression_state = torch.load(os.path.join(regression_path, "regression_head.pth"))
 model.regression_head.load_state_dict(regression_state)
 # 检查模型是否加载成功
@@ -204,10 +218,14 @@ for batch in process_bar:
             attention_mask=torch.tensor(attention_mask).to(device)
         )
     predictions.extend(preds.view(-1).tolist())
+output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/pred.txt"
+with open(output_path,"w",encoding='utf-8') as f:
+    for pred in predictions:
+        f.write(f"{pred}\n")
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.612:
+        if pred >= 0.401:
             f.write("1\n")
         else:
             f.write("0\n")

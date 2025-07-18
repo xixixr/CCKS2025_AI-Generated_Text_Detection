@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
+    parser.add_argument("--concat_layers",type = str,default="6,12,-1",help="Use what layers to regression")
     parser.add_argument("--model_name_or_path", 
                         type=str, 
                         default="/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct", 
@@ -37,11 +38,11 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
-
+args.concat_layers = [int(i) for i in args.concat_layers.split(",")]  # 转换为整数列表
 def create_collate_fn(tokenizer):
     def collate_fn(batch):
         # 将 input_ids 和 attention_mask 提取出来作为字典列表
@@ -65,20 +66,22 @@ def create_collate_fn(tokenizer):
     return collate_fn
 
 class CustomModel(nn.Module):
-    def __init__(self, model_name, num_labels,mean_pooling):
+    def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
         super().__init__()
         self.num_labels = num_labels
         self.mean_pooling = mean_pooling
+        self.concat_layers = concat_layers
         self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
         self.hidden_size = self.base_model.config.hidden_size
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = self.base_model.config.bos_token_id
+        output_len = len(self.concat_layers)*self.hidden_size
         self.regression_head = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
             nn.Dropout(0.1),       # 防过拟合
-            nn.Linear(self.hidden_size // 2, self.num_labels)
+            nn.Linear(output_len // 2, self.num_labels)
             )
         # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
     def forward(self,
@@ -86,12 +89,17 @@ class CustomModel(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None):
 
-            
-        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds)
+        
+        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds,output_hidden_states = True)
+        hidden_states = output.hidden_states
+        selected_states = [hidden_states[i] for i in self.concat_layers] # list consist of (batch_size,seq_len,hidden_size)
         hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
         if self.mean_pooling:
-            masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
-            pooled_output = masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1) #(batch_size,hidden_size)
+            pooled_output = []
+            for hidden_states in selected_states:
+                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+                pooled_output.append(masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)) # list of (batch_size,hidden_size)
+            pooled_output = torch.cat(pooled_output,dim=-1) #(batch_size,hidden_size*len(self.concat_layers))
             logits = self.regression_head(pooled_output) #(batch_size,num_labels)
             return logits
         # find the last token hidden state
@@ -103,13 +111,19 @@ class CustomModel(nn.Module):
             non_pad_mask = attention_mask.bool()
         if input_ids is None and attention_mask is None:
             raise ValueError("At least one of input_ids or attention_mask must be provided.")
-        token_indices = torch.arange(input_ids.shape[-1],device=input_ids.device) # (seq_len)
+        seq_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+        token_indices = torch.arange(seq_len,device=input_ids.device) # (seq_len)
         last_non_pad_token = (token_indices*non_pad_mask).argmax(dim = -1) #(batch_size)
-        last_token_hidden_states = hidden_states[torch.arange(batch_size),last_non_pad_token] # (batch_size,hidden_size)
+        last_token_hidden_states = []
+        for hidden_states in selected_states:
+            if hidden_states.shape[1] <= last_non_pad_token.max():
+                raise ValueError("The last non-pad token index exceeds the sequence length of the hidden states.")
+            last_token_hidden_states.append(hidden_states[torch.arange(batch_size),last_non_pad_token])  # list of (batch_size,hidden_size)
+        last_token_hidden_states = torch.cat(last_token_hidden_states,dim=-1) # (batch_size,hidden_size*len(self.concat_layers))
         logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
     
-def evaluate(model,val_loader,writer,epoch):
+def evaluate(model,val_loader,writer,step):
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -121,11 +135,11 @@ def evaluate(model,val_loader,writer,epoch):
             with torch.cuda.amp.autocast():
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = F.mse_loss(logits.view(-1), labels.float().view(-1))
-            writer.add_scalar("val/loss", loss.item(), epoch)
+            
             total_loss += loss.item()
             num_batches += 1
     avg_loss = total_loss / num_batches
-    
+    writer.add_scalar("val/loss", avg_loss, step)
     return avg_loss   
 
         
@@ -153,11 +167,15 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader):
             process_bar.set_postfix({"loss": loss.item()})
             train_total_loss += loss.item()
             batches += 1
+            if batches%500==0:
+                val_loss = evaluate(model, val_loader, writer, batches//500)
+                model.train()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
-        val_loss = evaluate(model, val_loader, writer, epoch)
+        val_loss = evaluate(model, val_loader, writer, batches//500+1)
         print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
         print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
         model.train()
+        
     writer.close()  # 关闭TensorBoard记录器    
             
 if __name__ == "__main__":
@@ -170,13 +188,14 @@ if __name__ == "__main__":
     # 加载模型和分词器
     model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name,local_files_only=True,trust_remote_code=True,padding_side="left")
-    model = CustomModel(model_name,args.num_labels,args.mean_pooling)
+    model = CustomModel(model_name,args.num_labels,args.mean_pooling,args.concat_layers)
     
     lora_config = LoraConfig(
         r=8,  # LoRA rank
         lora_alpha=8,  # LoRA alpha
         target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"], # 需要应用LoRA的模块
         bias = "none",  # LoRA偏置
+        lora_dropout=0.1,
         task_type= TaskType.FEATURE_EXTRACTION
     )
     print(f"Model loaded from {model_name}, Finish loading model")
@@ -204,6 +223,8 @@ if __name__ == "__main__":
         model_input = tokenizer(
             example["text"],
             add_special_tokens=True,
+            max_length=1024,
+            truncation=True
             # max_length=1024, 
             # padding="max_length",  # 使用最大长度填充
             # truncation=True  # 截断超过最大长度的文本
