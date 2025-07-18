@@ -38,11 +38,13 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers3/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
 args.concat_layers = [int(i) for i in args.concat_layers.split(",")]  # 转换为整数列表
+# loss_fn = nn.BCEWithLogitsLoss()
+loss_fn = nn.MSELoss()  # 使用均方误差损失函数
 def create_collate_fn(tokenizer):
     def collate_fn(batch):
         # 将 input_ids 和 attention_mask 提取出来作为字典列表
@@ -123,24 +125,51 @@ class CustomModel(nn.Module):
         logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
     
-def evaluate(model,val_loader,writer,step):
+# def evaluate(model,val_loader,writer,step):
+#     model.eval()
+#     total_loss = 0.0
+#     num_batches = 0
+#     with torch.no_grad():
+#         for batch in tqdm(val_loader,desc="Evaluating"):
+#             input_ids = batch["input_ids"]
+#             attention_mask = batch["attention_mask"]
+#             labels = batch["labels"]
+#             with torch.cuda.amp.autocast():
+#                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
+#                 loss = F.mse_loss(logits.view(-1), labels.float().view(-1))
+            
+#             total_loss += loss.item()
+#             num_batches += 1
+#     avg_loss = total_loss / num_batches
+#     writer.add_scalar("val/loss", avg_loss, step)
+#     return avg_loss   
+
+def evaluate(model, val_loader, writer, step):
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    correct = 0
+    total = 0
     with torch.no_grad():
-        for batch in tqdm(val_loader,desc="Evaluating"):
+        for batch in tqdm(val_loader, desc="Evaluating"):
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
-            with torch.cuda.amp.autocast():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = F.mse_loss(logits.view(-1), labels.float().view(-1))
-            
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = loss_fn(logits.view(-1), labels.float().view(-1))
+
+            preds = torch.sigmoid(logits).view(-1) > 0.5
+            correct += (preds == labels.bool()).sum().item()
+            total += labels.size(0)
+
             total_loss += loss.item()
             num_batches += 1
+
     avg_loss = total_loss / num_batches
+    acc = correct / total
     writer.add_scalar("val/loss", avg_loss, step)
-    return avg_loss   
+    # writer.add_scalar("val/accuracy", acc, step)
+    return avg_loss
 
         
 # 训练循环
@@ -157,7 +186,7 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader):
 
             with torch.cuda.amp.autocast():  # 使用混合精度计算
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = F.mse_loss(logits.view(-1), labels.float().view(-1))  # 使用均方误差损失
+                loss = loss_fn(logits.view(-1), labels.float().view(-1))
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
@@ -192,7 +221,7 @@ if __name__ == "__main__":
     
     lora_config = LoraConfig(
         r=8,  # LoRA rank
-        lora_alpha=8,  # LoRA alpha
+        lora_alpha=32,  # LoRA alpha
         target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"], # 需要应用LoRA的模块
         bias = "none",  # LoRA偏置
         lora_dropout=0.1,

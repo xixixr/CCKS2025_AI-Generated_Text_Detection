@@ -10,6 +10,7 @@ from typing import Optional
 
 mean_pooling=False
 concat_layers = [6,12,-1]
+use_BCE = False  # 是否使用BCE损失函数
 class CustomModel(nn.Module):
     def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
         super().__init__()
@@ -73,11 +74,12 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
 model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
 
-
-adapter_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers/lora"
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers2"
+adapter_path = path +"/lora"
+print(f"载入模型为{adapter_path.split('/')[-2]}")
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
 
-regression_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers"
+regression_path = path
 regression_state = torch.load(os.path.join(regression_path, "regression_head.pth"))
 model.regression_head.load_state_dict(regression_state)
 # 检查模型是否加载成功
@@ -145,7 +147,11 @@ for batch in process_bar:
             input_ids=torch.tensor(input_ids).to(device),
             attention_mask=torch.tensor(attention_mask).to(device)
         )
-    predictions.extend(preds.view(-1).tolist())
+    if use_BCE:
+        preds = torch.sigmoid(preds).view(-1)  # 使用sigmoid函数将输出转换为概率
+    else:
+        preds = preds.view(-1)
+    predictions.extend(preds.tolist())
     gt.extend(labels)
     
 results = []
@@ -217,15 +223,15 @@ for batch in process_bar:
             input_ids=torch.tensor(input_ids).to(device),
             attention_mask=torch.tensor(attention_mask).to(device)
         )
-    predictions.extend(preds.view(-1).tolist())
-output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/pred.txt"
-with open(output_path,"w",encoding='utf-8') as f:
-    for pred in predictions:
-        f.write(f"{pred}\n")
+    if use_BCE:
+        preds = torch.sigmoid(preds).view(-1)
+    else:
+        preds = preds.view(-1)
+    predictions.extend(preds.tolist())
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.401:
+        if pred >= 0.5355:
             f.write("1\n")
         else:
             f.write("0\n")

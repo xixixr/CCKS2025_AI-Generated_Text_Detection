@@ -18,7 +18,7 @@ if __name__ == "__main__":
     results_train['probability'] = probabilities
     max_F1,max_p =0,[]
     prediction = []
-    for p in tqdm(np.arange(0,1,0.0005)):
+    for p in tqdm(np.arange(0,0.95,0.0005)):
         predictions = [int(i>=p) for i in probabilities]
         # 计算True Positive, False Positive, True Negative, False Negative
         TP = sum((pred == 1 and label == 1) for pred, label in zip(predictions, labels))
