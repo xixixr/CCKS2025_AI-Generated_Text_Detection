@@ -27,7 +27,8 @@ def parse_args():
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
-    parser.add_argument("--concat_layers",type = str,default="8,16,-1",help="Use what layers to regression")
+    parser.add_argument("--concat_layers",type = str,default="3,8,16,-1",help="Use what layers to regression")
+    parser.add_argument("--use_FGM",type=bool,default=False,help="Whether to use FGM for adversarial training")
     parser.add_argument("--model_name_or_path", 
                         type=str, 
                         default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct", 
@@ -41,11 +42,39 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/dropout2/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/dropout_fgm/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
 args.concat_layers = [int(i) for i in args.concat_layers.split(",")]  # 转换为整数列表
+
+
+class FGM:
+    def __init__(self, model, epsilon=1.0, emb_name='word_embeddings'):
+        self.model = model
+        self.epsilon = epsilon
+        self.backup = {}
+        self.emb_name = emb_name
+
+    def attack(self):
+        # 遍历模型中的参数，寻找 embedding 层
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name:
+                if param.grad is None:
+                    continue
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):
+                    r_at = self.epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self):
+        # 恢复参数
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
 
 def create_collate_fn(tokenizer):
     def collate_fn(batch):
@@ -85,7 +114,11 @@ class CustomModel(nn.Module):
             nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
             nn.Dropout(0.2),       # 防过拟合
-            nn.Linear(output_len // 2, self.num_labels)
+            # nn.Linear(output_len // 2, self.num_labels)
+            nn.Linear(output_len // 2, output_len//4),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(output_len//4, num_labels)
             )
         # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
     def forward(self,
@@ -134,6 +167,7 @@ def evaluate(model, val_loader, writer, step, accelerator):
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    correct = 0
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
             input_ids = batch["input_ids"]
@@ -141,18 +175,20 @@ def evaluate(model, val_loader, writer, step, accelerator):
             labels = batch["labels"]
             logits = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = loss_fn(logits.view(-1), labels.float().view(-1))
-
+            preds = logits.view(-1) > 0.5
+            correct += (preds == labels.bool()).sum().item()
             total_loss += accelerator.gather(loss).mean().item()
             num_batches += 1
     avg_loss = total_loss / num_batches
+    avg_acc = correct / (num_batches * args.batch_size)
     if accelerator.is_main_process:
         writer.add_scalar("val/loss", avg_loss, step)
-
+        writer.add_scalar("val/acc", avg_acc, step)
     return avg_loss
 
     
 # 训练循环
-def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,accelerator):
+def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,accelerator,use_fgm,fgm=None):
     model.train()
     train_total_loss = 0
     batches = 0
@@ -168,6 +204,15 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
                 loss = loss_fn(logits.view(-1), labels.float().view(-1))
                 loss = loss/ args.gradient_accumulation_steps  # 梯度累积
             accelerator.backward(loss)
+            if use_fgm:
+                fgm.attack()  # 添加扰动
+                with torch.amp.autocast(device_type='cuda'):
+                    logits_adv = model(input_ids=input_ids, attention_mask=attention_mask)
+                    loss_adv = loss_fn(logits_adv.view(-1), labels.float().view(-1))
+                    loss_adv = loss_adv / args.gradient_accumulation_steps
+
+                accelerator.backward(loss_adv)
+                fgm.restore()  # 恢复原参数
             if (step+1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -175,7 +220,10 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
                 process_bar.set_postfix({"loss": loss.item()})
             if (step+1)%10==0:
                 writer.add_scalar("train/loss", loss.item(), epoch * len(data_iterator) + (step+1)//10)
-            train_total_loss += loss.item()
+            if use_fgm:
+                train_total_loss += (loss.item() + loss_adv.item())
+            else:
+                train_total_loss += loss.item()
             batches += 1
             if (step+1)%(800)==0:
                 val_loss = evaluate(model, val_loader, writer, (step+1)//(800), accelerator)
@@ -200,8 +248,8 @@ if __name__ == "__main__":
     model = CustomModel(model_name,args.num_labels,args.mean_pooling,args.concat_layers)
     model = model.bfloat16() # 使用bfloat16精度
     lora_config = LoraConfig(
-        r= 16,  # LoRA rank
-        lora_alpha=32,  # LoRA alpha
+        r= 8,  # LoRA rank
+        lora_alpha=16,  # LoRA alpha
         target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"], # 需要应用LoRA的模块
         bias = "none",  # LoRA偏置
         lora_dropout=0.2,
@@ -234,9 +282,6 @@ if __name__ == "__main__":
             add_special_tokens=True,
             max_length=1024,
             truncation=True
-            # max_length=1024, 
-            # padding="max_length",  # 使用最大长度填充
-            # truncation=True  # 截断超过最大长度的文本
         )
         return {
             "input_ids": model_input["input_ids"],
@@ -277,9 +322,16 @@ if __name__ == "__main__":
     from transformers.optimization import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=int(0.1*total_step),num_training_steps=total_step)
     accelerator.print("Finish preparing optimizer and scheduler")
+    # FGM对抗训练
+    use_fgm = args.use_FGM
+    if use_fgm:
+        fgm = FGM(model, epsilon=1.0, emb_name='embed_tokens')
+        print("Using FGM for adversarial training")
+    else:
+        fgm = None
     # 开始训练
     accelerator.print("Start training...")
-    train(train_loader,model,optimizer,scheduler,args.epochs,writer, val_loader,accelerator)
+    train(train_loader,model,optimizer,scheduler,args.epochs,writer, val_loader,accelerator,use_fgm,fgm)
     
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)

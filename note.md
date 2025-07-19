@@ -80,6 +80,7 @@ default lora config
 |9|8|5e-5|dropput = 0.1 a = 32|1|cosine_schedule_with_warmup|MSE|0.606|0.0466/0.0039|0.8114|regression_head update + concat_layers3|
 |10|8|5e-5|dropput = 0.1 r =16 ,a = 32|1|cosine_schedule_with_warmup|MSE|0.5435|0.0495/0.0041|0.8312|regression_head update + concat_layers4|
 |11|8|5e-5|dropput = 0.1 a = 16,qkvo|1|cosine_schedule_with_warmup|MSE|-|0.0699/0.0075|-|regression_head update + concat_layers|
+|12|8|5e-5|dropput = 0.1 r =16 ,a = 32|1|cosine_schedule_with_warmup|MSE|0.565|0.0952/0.0040|0.8139|regression_head update + concat_layers +fgm对抗训练|
 ### 使用qwen2.5-7B-instruct
 default:concat_layers:[8,16,-1]，使用last_token的hidden_state,使用两层线性层的regression_head 
 ```python
@@ -93,11 +94,11 @@ default:concat_layers:[8,16,-1]，使用last_token的hidden_state,使用两层�
 )
  ```
 ```
-/data/workspace/xiarui/.conda/envs/learning_xr/bin/python /data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/Qwen/finetune_lora_accumulation.py
+
  CUDA_VISIBLE_DEVICES=1,2,3,4 accelerate launch --config_file accelerate_config.yaml finetune_lora_accelerate.py 
  ```
 |idx |batch_size |lr  |lora config|epoch |scheduler|loss|threshold|train/val loss| acc|note
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |1|2*4|2e-5|default|1|cosine_schedule_with_warmup|MSE|0.4|0.0198/0.0089|0.7871|default:过拟合|
-|2|2*4|2e-5|lora_dropout = 0.2|1|cosine_schedule_with_warmup|MSE|0.563|0.0256/0.0027||regression dropout = 0.2|
-|3|2*4|2e-5|lora_dropout = 0.2 l=16,r=32|1|cosine_schedule_with_warmup|MSE||||regression dropout = 0.2|
+|2|2*4|2e-5|dropout = 0.2|1|cosine_schedule_with_warmup|MSE|0.563|0.0256/0.0027|0.8410|dropout|
+|3|2*4|2e-5|dropout = 0.2 r=16,a=32|1|cosine_schedule_with_warmup|MSE|0.2235|0.0211/0.0094|-|dropout2:过拟合|

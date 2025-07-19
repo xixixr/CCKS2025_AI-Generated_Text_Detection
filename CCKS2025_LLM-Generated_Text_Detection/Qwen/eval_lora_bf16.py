@@ -232,7 +232,7 @@ for batch in process_bar:
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.563:
+        if pred >= 0.2235:
             f.write("1\n")
         else:
             f.write("0\n")

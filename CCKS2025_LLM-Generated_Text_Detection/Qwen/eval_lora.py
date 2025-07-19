@@ -3,7 +3,7 @@ from transformers import AutoModel, AutoTokenizer
 import torch
 import torch.nn as nn
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from typing import Optional
@@ -74,7 +74,7 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
 model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
 
-path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers4"
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers_fgm"
 adapter_path = path +"/lora"
 print(f"载入模型为{adapter_path.split('/')[-2]}")
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
@@ -231,7 +231,7 @@ for batch in process_bar:
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.5435:
+        if pred >= 0.565:
             f.write("1\n")
         else:
             f.write("0\n")
