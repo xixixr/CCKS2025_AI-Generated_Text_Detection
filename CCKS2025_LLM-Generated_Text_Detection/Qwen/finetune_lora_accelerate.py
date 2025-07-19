@@ -11,6 +11,7 @@ from typing import Optional
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from peft import get_peft_model,LoraConfig,TaskType
+import torch.distributed as dist
 
 # 设置随机数种子
 random_seed = 114514
@@ -20,15 +21,16 @@ loss_fn = nn.MSELoss()  # 使用均方误差损失函数
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu_num",type=int,default=1,help="Number of GPUs to use (default: 1)")
-    parser.add_argument("--batch_size",type=int,default=8,help="Batch size for training")
+    parser.add_argument("--batch_size",type=int,default=2,help="Batch size for training")
+    parser.add_argument("--gradient_accumulation_steps",type=int,default=4,help="Number of gradient accumulation steps")
     parser.add_argument("--learning_rate",type=float,default=5e-5,help="Learning rate")
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
-    parser.add_argument("--concat_layers",type = str,default="6,12,-1",help="Use what layers to regression")
+    parser.add_argument("--concat_layers",type = str,default="8,16,-1",help="Use what layers to regression")
     parser.add_argument("--model_name_or_path", 
                         type=str, 
-                        default="/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct", 
                         help="Pretrained model path")
     parser.add_argument("--train_file", type=str, 
                         default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/train.jsonl", 
@@ -39,7 +41,7 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers_qkvo/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/dropout2/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
@@ -82,7 +84,7 @@ class CustomModel(nn.Module):
         self.regression_head = nn.Sequential(
             nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
-            nn.Dropout(0.1),       # 防过拟合
+            nn.Dropout(0.2),       # 防过拟合
             nn.Linear(output_len // 2, self.num_labels)
             )
         # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
@@ -125,31 +127,13 @@ class CustomModel(nn.Module):
         logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
         return logits
     
-# def evaluate(model,val_loader,writer,step):
-#     model.eval()
-#     total_loss = 0.0
-#     num_batches = 0
-#     with torch.no_grad():
-#         for batch in tqdm(val_loader,desc="Evaluating"):
-#             input_ids = batch["input_ids"]
-#             attention_mask = batch["attention_mask"]
-#             labels = batch["labels"]
-#             with torch.cuda.amp.autocast():
-#                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
-#                 loss = F.mse_loss(logits.view(-1), labels.float().view(-1))
-            
-#             total_loss += loss.item()
-#             num_batches += 1
-#     avg_loss = total_loss / num_batches
-#     writer.add_scalar("val/loss", avg_loss, step)
-#     return avg_loss   
 
-def evaluate(model, val_loader, writer, step):
+
+
+def evaluate(model, val_loader, writer, step, accelerator):
     model.eval()
     total_loss = 0.0
     num_batches = 0
-    correct = 0
-    total = 0
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
             input_ids = batch["input_ids"]
@@ -158,20 +142,15 @@ def evaluate(model, val_loader, writer, step):
             logits = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = loss_fn(logits.view(-1), labels.float().view(-1))
 
-            preds = torch.sigmoid(logits).view(-1) > 0.5
-            correct += (preds == labels.bool()).sum().item()
-            total += labels.size(0)
-
-            total_loss += loss.item()
+            total_loss += accelerator.gather(loss).mean().item()
             num_batches += 1
-
     avg_loss = total_loss / num_batches
-    acc = correct / total
-    writer.add_scalar("val/loss", avg_loss, step)
-    # writer.add_scalar("val/accuracy", acc, step)
+    if accelerator.is_main_process:
+        writer.add_scalar("val/loss", avg_loss, step)
+
     return avg_loss
 
-        
+    
 # 训练循环
 def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,accelerator):
     model.train()
@@ -179,36 +158,37 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
     batches = 0
     for epoch in range(epochs):
         process_bar  = tqdm(data_iterator, desc=f"Epoch {epoch + 1}/{epochs}")
-        for batch in process_bar:
+        for step,batch in enumerate(process_bar):
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
 
-            with torch.cuda.amp.autocast():  # 使用混合精度计算
+            with torch.amp.autocast(device_type='cuda'): # 使用混合精度计算
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = loss_fn(logits.view(-1), labels.float().view(-1))
+                loss = loss/ args.gradient_accumulation_steps  # 梯度累积
             accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()  # 更新学习率
-            writer.add_scalar("train/loss", loss.item(), epoch * len(data_iterator) + process_bar.n)
-            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch * len(data_iterator) + process_bar.n)
-            process_bar.set_postfix({"loss": loss.item()})
+            if (step+1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()  # 更新学习率
+                process_bar.set_postfix({"loss": loss.item()})
+            if (step+1)%10==0:
+                writer.add_scalar("train/loss", loss.item(), epoch * len(data_iterator) + (step+1)//10)
             train_total_loss += loss.item()
             batches += 1
-            if batches%500==0:
-                val_loss = evaluate(model, val_loader, writer, batches//500)
+            if (step+1)%(800)==0:
+                val_loss = evaluate(model, val_loader, writer, (step+1)//(800), accelerator)
                 model.train()
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
-        val_loss = evaluate(model, val_loader, writer, batches//500+1)
-        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
-        print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
+        accelerator.print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
+        val_loss = evaluate(model, val_loader, writer,(step+1)//(800)+1 , accelerator)
+        accelerator.print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
+        accelerator.print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
         model.train()
         
     writer.close()  # 关闭TensorBoard记录器    
             
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
     
     log_dir = args.output_dir + "/logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -218,13 +198,13 @@ if __name__ == "__main__":
     model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name,local_files_only=True,trust_remote_code=True,padding_side="left")
     model = CustomModel(model_name,args.num_labels,args.mean_pooling,args.concat_layers)
-    
+    model = model.bfloat16() # 使用bfloat16精度
     lora_config = LoraConfig(
-        r=8,  # LoRA rank
-        lora_alpha=16,  # LoRA alpha
+        r= 16,  # LoRA rank
+        lora_alpha=32,  # LoRA alpha
         target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"], # 需要应用LoRA的模块
         bias = "none",  # LoRA偏置
-        lora_dropout=0.1,
+        lora_dropout=0.2,
         task_type= TaskType.FEATURE_EXTRACTION
     )
     print(f"Model loaded from {model_name}, Finish loading model")
@@ -254,6 +234,9 @@ if __name__ == "__main__":
             add_special_tokens=True,
             max_length=1024,
             truncation=True
+            # max_length=1024, 
+            # padding="max_length",  # 使用最大长度填充
+            # truncation=True  # 截断超过最大长度的文本
         )
         return {
             "input_ids": model_input["input_ids"],
@@ -282,29 +265,28 @@ if __name__ == "__main__":
     
     
     # 优化器和学习率调度器
-    total_step = len(train_loader)*args.epochs
+    total_step = len(train_loader)*args.epochs//args.gradient_accumulation_steps
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
     
     # 使用Accelerator进行分布式训练
     from accelerate import Accelerator
-    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator = Accelerator(mixed_precision="bf16")
     model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
 
     
     from transformers.optimization import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=int(0.1*total_step),num_training_steps=total_step)
-    print("Finish preparing optimizer and scheduler")
+    accelerator.print("Finish preparing optimizer and scheduler")
     # 开始训练
-    print("Start training...")
+    accelerator.print("Start training...")
     train(train_loader,model,optimizer,scheduler,args.epochs,writer, val_loader,accelerator)
     
-    # 保存
-    os.makedirs(args.output_dir, exist_ok=True)
-    # 保存LoRA adapter
-    model.base_model.save_pretrained(os.path.join(args.output_dir, "lora"))
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.base_model.save_pretrained(os.path.join(args.output_dir, "lora"))
+        torch.save(unwrapped_model.regression_head.state_dict(), os.path.join(args.output_dir, "regression_head.pth"))
 
-    # 保存regression_head参数
-    torch.save(model.regression_head.state_dict(), os.path.join(args.output_dir, "regression_head.pth"))
-
-
-
+    if accelerator.distributed_type != accelerator.distributed_type.NO:
+        accelerator.wait_for_everyone()  # 确保所有进程同步
+        dist.destroy_process_group()  # 销毁进程组

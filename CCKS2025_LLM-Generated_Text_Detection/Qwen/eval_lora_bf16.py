@@ -3,13 +3,13 @@ from transformers import AutoModel, AutoTokenizer
 import torch
 import torch.nn as nn
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from typing import Optional
 
 mean_pooling=False
-concat_layers = [6,12,-1]
+concat_layers = [8,16,-1]
 use_BCE = False  # 是否使用BCE损失函数
 class CustomModel(nn.Module):
     def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
@@ -26,7 +26,7 @@ class CustomModel(nn.Module):
         self.regression_head = nn.Sequential(
             nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
-            nn.Dropout(0.1),       # 防过拟合
+            nn.Dropout(0.2),       # 防过拟合
             nn.Linear(output_len // 2, self.num_labels)
             )
         # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
@@ -71,10 +71,10 @@ class CustomModel(nn.Module):
     
 # 载入模型
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
-model_name = "/data/shared_workspace/xiarui/huggingface/Qwen/Qwen2.5-0.5B-Instruct"
+model_name = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct"
 model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
 
-path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-0.5B-Instruct/finetune_lora/regression_update_concat_layers4"
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/dropout2"
 adapter_path = path +"/lora"
 print(f"载入模型为{adapter_path.split('/')[-2]}")
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
@@ -85,6 +85,7 @@ model.regression_head.load_state_dict(regression_state)
 # 检查模型是否加载成功
 if model is None:
     raise ValueError("Failed to load the model. Please check the model path and ensure it exists.")
+model = model.bfloat16()
 model.to(device)
 # 设置模型为评估模式
 model.eval()
@@ -231,7 +232,7 @@ for batch in process_bar:
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.5435:
+        if pred >= 0.563:
             f.write("1\n")
         else:
             f.write("0\n")
