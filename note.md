@@ -102,3 +102,14 @@ default:concat_layers:[8,16,-1]，使用last_token的hidden_state,使用两层�
 |1|2*4|2e-5|default|1|cosine_schedule_with_warmup|MSE|0.4|0.0198/0.0089|0.7871|default:过拟合|
 |2|2*4|2e-5|dropout = 0.2|1|cosine_schedule_with_warmup|MSE|0.563|0.0256/0.0027|0.8410|dropout|
 |3|2*4|2e-5|dropout = 0.2 r=16,a=32|1|cosine_schedule_with_warmup|MSE|0.2235|0.0211/0.0094|-|dropout2:过拟合|
+|4|2*4|5e-5|default|1|cosine_schedule_with_warmup|MSE|0.447|0.0193/0.0030|0.8179|[3,8,16,-1]concat|
+|5|2*4|5e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.55|0.0045/0.0015|0.8436|[3,8,16,-1] 3heads|
+|6|2*4|5e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.563|0.0045/0.0015|0.8467|[3,8,16,-1] 3heads|
+|7|2*4|5e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.58|0.0045/0.0015|0.8478|[3,8,16,-1] 3heads|
+
+### 使用三种不同模型进行投票
+|model |batch_size |lr  |lora config|epoch |scheduler|loss|threshold|train| acc|note
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|qwen2.5-7B-instruct|2*4|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.58|0.0054|0.8609|[3,8,16,-1] 3heads all data|
+|Meta-Llama-3-8B|2*4|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|-|0.0051|-|[3,8,17,-1] 3heads all data|
+|glm-4-9b-chat-hf|1*8|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|-||-|[4,9,19,-1] 3heads all data|

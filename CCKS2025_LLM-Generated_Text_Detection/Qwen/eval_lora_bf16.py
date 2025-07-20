@@ -1,15 +1,19 @@
 #%%
+#设置推理的卡
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+#%%
+# 加载qwen
 from transformers import AutoModel, AutoTokenizer
 import torch
 import torch.nn as nn
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from typing import Optional
 
 mean_pooling=False
-concat_layers = [8,16,-1]
+concat_layers = [3,8,16,-1]
 use_BCE = False  # 是否使用BCE损失函数
 class CustomModel(nn.Module):
     def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
@@ -27,7 +31,11 @@ class CustomModel(nn.Module):
             nn.Linear(output_len, output_len // 2),
             nn.SiLU(),             # 与主模型激活一致
             nn.Dropout(0.2),       # 防过拟合
-            nn.Linear(output_len // 2, self.num_labels)
+            # nn.Linear(output_len // 2, self.num_labels)
+            nn.Linear(output_len // 2, output_len//4),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(output_len//4, num_labels)
             )
         # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
     def forward(self,
@@ -74,7 +82,210 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model_name = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct"
 model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
 
-path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/dropout2"
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/Qwen/Qwen2.5-7B-Instruct"
+adapter_path = path +"/lora"
+print(f"载入模型为{adapter_path.split('/')[-2]}")
+model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
+
+regression_path = path
+regression_state = torch.load(os.path.join(regression_path, "regression_head.pth"))
+model.regression_head.load_state_dict(regression_state)
+# 检查模型是否加载成功
+if model is None:
+    raise ValueError("Failed to load the model. Please check the model path and ensure it exists.")
+model = model.bfloat16()
+model.to(device)
+# 设置模型为评估模式
+model.eval()
+
+
+# 加载分词器
+tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, trust_remote_code=True, padding_side="left")
+#%%
+# 加载llama3
+from transformers import AutoModel, AutoTokenizer
+import torch
+import torch.nn as nn
+from peft import PeftModel
+from torch.utils.data import DataLoader
+from typing import Optional
+
+mean_pooling=False
+concat_layers = [3,8,17,-1]
+use_BCE = False  # 是否使用BCE损失函数
+class CustomModel(nn.Module):
+    def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
+        super().__init__()
+        self.num_labels = num_labels
+        self.mean_pooling = mean_pooling
+        self.concat_layers = concat_layers
+        self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
+        self.hidden_size = self.base_model.config.hidden_size
+        self.pad_token_id = self.base_model.config.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = self.base_model.config.eos_token_id
+            if self.pad_token_id != 128001:
+                exit(0)
+        output_len = len(self.concat_layers)*self.hidden_size
+        self.regression_head = nn.Sequential(
+            nn.Linear(output_len, output_len // 2),
+            nn.SiLU(),             # 与主模型激活一致
+            nn.Dropout(0.2),       # 防过拟合
+            # nn.Linear(output_len // 2, self.num_labels)
+            nn.Linear(output_len // 2, output_len//4),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(output_len//4, num_labels)
+            )
+        # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
+    def forward(self,
+                input_ids: Optional[torch.LongTensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None):
+
+        
+        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds,output_hidden_states = True)
+        hidden_states = output.hidden_states
+        selected_states = [hidden_states[i] for i in self.concat_layers] # list consist of (batch_size,seq_len,hidden_size)
+        hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
+        if self.mean_pooling:
+            pooled_output = []
+            for hidden_states in selected_states:
+                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+                pooled_output.append(masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)) # list of (batch_size,hidden_size)
+            pooled_output = torch.cat(pooled_output,dim=-1) #(batch_size,hidden_size*len(self.concat_layers))
+            logits = self.regression_head(pooled_output) #(batch_size,num_labels)
+            return logits
+        # find the last token hidden state
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+            non_pad_mask = (input_ids != self.pad_token_id) # (batch_size,seq_len)
+        else:
+            batch_size = inputs_embeds.shape[0]
+            non_pad_mask = attention_mask.bool()
+        if input_ids is None and attention_mask is None:
+            raise ValueError("At least one of input_ids or attention_mask must be provided.")
+        seq_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+        token_indices = torch.arange(seq_len,device=input_ids.device) # (seq_len)
+        last_non_pad_token = (token_indices*non_pad_mask).argmax(dim = -1) #(batch_size)
+        last_token_hidden_states = []
+        for hidden_states in selected_states:
+            if hidden_states.shape[1] <= last_non_pad_token.max():
+                raise ValueError("The last non-pad token index exceeds the sequence length of the hidden states.")
+            last_token_hidden_states.append(hidden_states[torch.arange(batch_size),last_non_pad_token])  # list of (batch_size,hidden_size)
+        last_token_hidden_states = torch.cat(last_token_hidden_states,dim=-1) # (batch_size,hidden_size*len(self.concat_layers))
+        logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
+        return logits
+    
+    
+# 载入模型
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+model_name = "/data/shared_workspace/LLM_weights/meta-llama/Meta-Llama-3-8B"
+model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
+
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/meta-llama/Meta-Llama-3-8B"
+adapter_path = path +"/lora"
+print(f"载入模型为{adapter_path.split('/')[-2]}")
+model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
+
+regression_path = path
+regression_state = torch.load(os.path.join(regression_path, "regression_head.pth"))
+model.regression_head.load_state_dict(regression_state)
+# 检查模型是否加载成功
+if model is None:
+    raise ValueError("Failed to load the model. Please check the model path and ensure it exists.")
+model = model.bfloat16()
+model.to(device)
+# 设置模型为评估模式
+model.eval()
+
+
+# 加载分词器
+tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, trust_remote_code=True, padding_side="left")
+tokenizer.pad_token = tokenizer.eos_token
+#%%
+# 加载GLM4
+from transformers import AutoModel, AutoTokenizer
+import torch
+import torch.nn as nn
+from peft import PeftModel
+from torch.utils.data import DataLoader
+from typing import Optional
+
+mean_pooling=False
+concat_layers = [4,9,19,-1]
+use_BCE = False  # 是否使用BCE损失函数
+class CustomModel(nn.Module):
+    def __init__(self, model_name, num_labels,mean_pooling,concat_layers):
+        super().__init__()
+        self.num_labels = num_labels
+        self.mean_pooling = mean_pooling
+        self.concat_layers = concat_layers
+        self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
+        self.hidden_size = self.base_model.config.hidden_size
+        self.pad_token_id = self.base_model.config.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = (self.base_model.config.eos_token_id)[0]
+            if self.pad_token_id != 151329:
+                exit(0)
+        output_len = len(self.concat_layers)*self.hidden_size
+        self.regression_head = nn.Sequential(
+            nn.Linear(output_len, output_len // 2),
+            nn.SiLU(),             # 与主模型激活一致
+            nn.Dropout(0.2),       # 防过拟合
+            # nn.Linear(output_len // 2, self.num_labels)
+            nn.Linear(output_len // 2, output_len//4),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(output_len//4, num_labels)
+            )
+        # self.regression_head = nn.Linear(self.hidden_size,self.num_labels)
+    def forward(self,
+                input_ids: Optional[torch.LongTensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None):
+
+        
+        output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds,output_hidden_states = True)
+        hidden_states = output.hidden_states
+        selected_states = [hidden_states[i] for i in self.concat_layers] # list consist of (batch_size,seq_len,hidden_size)
+        hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
+        if self.mean_pooling:
+            pooled_output = []
+            for hidden_states in selected_states:
+                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+                pooled_output.append(masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)) # list of (batch_size,hidden_size)
+            pooled_output = torch.cat(pooled_output,dim=-1) #(batch_size,hidden_size*len(self.concat_layers))
+            logits = self.regression_head(pooled_output) #(batch_size,num_labels)
+            return logits
+        # find the last token hidden state
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+            non_pad_mask = (input_ids != self.pad_token_id) # (batch_size,seq_len)
+        else:
+            batch_size = inputs_embeds.shape[0]
+            non_pad_mask = attention_mask.bool()
+        if input_ids is None and attention_mask is None:
+            raise ValueError("At least one of input_ids or attention_mask must be provided.")
+        seq_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+        token_indices = torch.arange(seq_len,device=input_ids.device) # (seq_len)
+        last_non_pad_token = (token_indices*non_pad_mask).argmax(dim = -1) #(batch_size)
+        last_token_hidden_states = []
+        for hidden_states in selected_states:
+            if hidden_states.shape[1] <= last_non_pad_token.max():
+                raise ValueError("The last non-pad token index exceeds the sequence length of the hidden states.")
+            last_token_hidden_states.append(hidden_states[torch.arange(batch_size),last_non_pad_token])  # list of (batch_size,hidden_size)
+        last_token_hidden_states = torch.cat(last_token_hidden_states,dim=-1) # (batch_size,hidden_size*len(self.concat_layers))
+        logits = self.regression_head(last_token_hidden_states) # (batch_size,num_labels)
+        return logits
+    
+    
+# 载入模型
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+model_name = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/THUDM/glm-4-9b-chat-hf"
+model = CustomModel(model_name, num_labels=1,mean_pooling=mean_pooling,concat_layers=concat_layers)
+
+path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/THUDM/glm-4-9b-chat-hf"
 adapter_path = path +"/lora"
 print(f"载入模型为{adapter_path.split('/')[-2]}")
 model.base_model = PeftModel.from_pretrained(model.base_model,adapter_path)
@@ -229,10 +440,14 @@ for batch in process_bar:
     else:
         preds = preds.view(-1)
     predictions.extend(preds.tolist())
+output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/pred/pred_llama.txt"
+with open(output_path, 'w', encoding='utf-8') as f:
+    for pred in predictions:
+        f.write(f"{pred}\n")
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.2235:
+        if pred >= 0.58:
             f.write("1\n")
         else:
             f.write("0\n")

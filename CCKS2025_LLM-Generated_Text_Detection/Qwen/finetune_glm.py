@@ -15,25 +15,24 @@ from peft import get_peft_model,LoraConfig,TaskType
 # 设置随机数种子
 random_seed = 114514
 torch.manual_seed(random_seed)
-# loss_fn = nn.BCEWithLogitsLoss()
 loss_fn = nn.MSELoss()  # 使用均方误差损失函数
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu_num",type=int,default=1,help="Number of GPUs to use (default: 1)")
-    parser.add_argument("--batch_size",type=int,default=2,help="Batch size for training")
-    parser.add_argument("--gradient_accumulation_steps",type=int,default=4,help="Number of gradient accumulation steps")
-    parser.add_argument("--learning_rate",type=float,default=5e-5,help="Learning rate")
+    parser.add_argument("--batch_size",type=int,default=1,help="Batch size for training")
+    parser.add_argument("--gradient_accumulation_steps",type=int,default=8,help="Number of gradient accumulation steps")
+    parser.add_argument("--learning_rate",type=float,default=2e-5,help="Learning rate")
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
-    parser.add_argument("--concat_layers",type = str,default="3,8,16,-1",help="Use what layers to regression")
+    parser.add_argument("--concat_layers",type = str,default="4,9,19,-1",help="Use what layers to regression")
     parser.add_argument("--use_FGM",type=bool,default=False,help="Whether to use FGM for adversarial training")
     parser.add_argument("--model_name_or_path", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/THUDM/glm-4-9b-chat-hf", 
                         help="Pretrained model path")
     parser.add_argument("--train_file", type=str, 
-                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/train.jsonl", 
+                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/train.jsonl", 
                         help="Path to training file")
     parser.add_argument("--val_file", 
                         type=str, 
@@ -41,7 +40,7 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/4layers_2dropout_3heads/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/THUDM/glm-4-9b-chat-hf/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
@@ -106,7 +105,9 @@ class CustomModel(nn.Module):
         self.hidden_size = self.base_model.config.hidden_size
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
-            self.pad_token_id = self.base_model.config.bos_token_id
+            self.pad_token_id = (self.base_model.config.eos_token_id)[0]
+            if self.pad_token_id != 151329:
+                exit(0)
         output_len = len(self.concat_layers)*self.hidden_size
         self.regression_head = nn.Sequential(
             nn.Linear(output_len, output_len // 2),
@@ -189,10 +190,9 @@ def evaluate(model, val_loader, writer, step):
 
         
 # 训练循环
-def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,accelerator,use_fgm,fgm=None):
+def train(data_iterator,model,optimizer,scheduler,epochs,writer, accelerator,use_fgm,fgm=None):
     model.train()
     train_total_loss = 0
-    batches = 0
     for epoch in range(epochs):
         process_bar  = tqdm(data_iterator, desc=f"Epoch {epoch + 1}/{epochs}")
         for step,batch in enumerate(process_bar):
@@ -225,19 +225,13 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
                 train_total_loss += (loss.item() + loss_adv.item())
             else:
                 train_total_loss += loss.item()
-            batches += 1
-            if (step+1)%(500*args.gradient_accumulation_steps)==0:
-                val_loss = evaluate(model, val_loader, writer, (step+1)//(500*args.gradient_accumulation_steps))
-                model.train()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
-        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
-        print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
-        model.train()
+        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/step:.4f}")
         
     writer.close()  # 关闭TensorBoard记录器    
             
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     
     log_dir = args.output_dir + "/logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -282,7 +276,10 @@ if __name__ == "__main__":
             example["text"],
             add_special_tokens=True,
             max_length=1024,
-            truncation=True
+            truncation=True,
+            # max_length=1024, 
+            # padding="max_length",  # 使用最大长度填充
+            # truncation=True  # 截断超过最大长度的文本
         )
         return {
             "input_ids": model_input["input_ids"],
@@ -292,21 +289,13 @@ if __name__ == "__main__":
     train_dataset = train_data.map(
         map_function,
         remove_columns=["text"],  # 移除原始文本列
-        num_proc=4,  # 使用4个进程进行并行处理
+        num_proc=4,  # 使用8个进程进行并行处理
         desc="Processing train data"
     )
     
     collate_fn = create_collate_fn(tokenizer)
     train_loader = DataLoader(train_dataset,batch_size=args.batch_size,shuffle = True,num_workers = 4,collate_fn=collate_fn)
-    val_dataset = val_data.map(
-    map_function,
-    remove_columns=["text"],
-    num_proc=4,
-    desc="Processing val data"
-    )
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
-
-    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    print(f"Train size: {len(train_dataset)}")
     
     
     
@@ -317,7 +306,7 @@ if __name__ == "__main__":
     # 使用Accelerator进行分布式训练
     from accelerate import Accelerator
     accelerator = Accelerator(mixed_precision="bf16")
-    model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
     
     from transformers.optimization import get_cosine_schedule_with_warmup
@@ -333,7 +322,7 @@ if __name__ == "__main__":
         fgm = None
     # 开始训练
     print("Start training...")
-    train(train_loader,model,optimizer,scheduler,args.epochs,writer, val_loader,accelerator,use_fgm,fgm)
+    train(train_loader,model,optimizer,scheduler,args.epochs,writer,accelerator,use_fgm,fgm)
     
     # 保存
     os.makedirs(args.output_dir, exist_ok=True)

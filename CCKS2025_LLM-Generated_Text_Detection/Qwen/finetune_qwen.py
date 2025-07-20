@@ -15,14 +15,13 @@ from peft import get_peft_model,LoraConfig,TaskType
 # 设置随机数种子
 random_seed = 114514
 torch.manual_seed(random_seed)
-# loss_fn = nn.BCEWithLogitsLoss()
 loss_fn = nn.MSELoss()  # 使用均方误差损失函数
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu_num",type=int,default=1,help="Number of GPUs to use (default: 1)")
     parser.add_argument("--batch_size",type=int,default=2,help="Batch size for training")
     parser.add_argument("--gradient_accumulation_steps",type=int,default=4,help="Number of gradient accumulation steps")
-    parser.add_argument("--learning_rate",type=float,default=5e-5,help="Learning rate")
+    parser.add_argument("--learning_rate",type=float,default=2e-5,help="Learning rate")
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
@@ -33,7 +32,7 @@ def parse_args():
                         default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct", 
                         help="Pretrained model path")
     parser.add_argument("--train_file", type=str, 
-                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/train.jsonl", 
+                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/train.jsonl", 
                         help="Path to training file")
     parser.add_argument("--val_file", 
                         type=str, 
@@ -41,7 +40,7 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/4layers_2dropout_3heads/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/Qwen/Qwen2.5-7B-Instruct/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
@@ -225,14 +224,8 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
                 train_total_loss += (loss.item() + loss_adv.item())
             else:
                 train_total_loss += loss.item()
-            batches += 1
-            if (step+1)%(500*args.gradient_accumulation_steps)==0:
-                val_loss = evaluate(model, val_loader, writer, (step+1)//(500*args.gradient_accumulation_steps))
-                model.train()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
-        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/batches:.4f}")
-        print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
-        model.train()
+        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/step:.4f}")
         
     writer.close()  # 关闭TensorBoard记录器    
             
@@ -283,6 +276,9 @@ if __name__ == "__main__":
             add_special_tokens=True,
             max_length=1024,
             truncation=True
+            # max_length=1024, 
+            # padding="max_length",  # 使用最大长度填充
+            # truncation=True  # 截断超过最大长度的文本
         )
         return {
             "input_ids": model_input["input_ids"],
@@ -292,7 +288,7 @@ if __name__ == "__main__":
     train_dataset = train_data.map(
         map_function,
         remove_columns=["text"],  # 移除原始文本列
-        num_proc=4,  # 使用4个进程进行并行处理
+        num_proc=4,  # 使用8个进程进行并行处理
         desc="Processing train data"
     )
     
