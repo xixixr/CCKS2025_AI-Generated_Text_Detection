@@ -112,4 +112,6 @@ default:concat_layers:[8,16,-1]，使用last_token的hidden_state,使用两层�
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |qwen2.5-7B-instruct|2*4|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.58|0.0054|0.8609|[3,8,16,-1] 3heads all data|
 |Meta-Llama-3-8B|2*4|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|-|0.0051|-|[3,8,17,-1] 3heads all data|
-|glm-4-9b-chat-hf|1*8|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|-||-|[4,9,19,-1] 3heads all data|
+|glm-4-9b-chat-hf|1*8|2e-5|dropout=0.2|1|cosine_schedule_with_warmup|MSE|0.58|0.0028|0.8419|[4,9,19,-1] 3heads all data|
+
+vote_hard :0.8609 vote_soft:0.8565

@@ -440,14 +440,14 @@ for batch in process_bar:
     else:
         preds = preds.view(-1)
     predictions.extend(preds.tolist())
-output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/pred/pred_llama.txt"
+output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/pred/pred_glm.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
         f.write(f"{pred}\n")
 output_path = "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/submit_B/submit.txt"
 with open(output_path, 'w', encoding='utf-8') as f:
     for pred in predictions:
-        if pred >= 0.58:
+        if pred >= 0.6:
             f.write("1\n")
         else:
             f.write("0\n")

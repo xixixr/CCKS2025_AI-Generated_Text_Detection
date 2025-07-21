@@ -15,24 +15,26 @@ from peft import get_peft_model,LoraConfig,TaskType
 # 设置随机数种子
 random_seed = 114514
 torch.manual_seed(random_seed)
-loss_fn = nn.MSELoss()  # 使用均方误差损失函数
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu_num",type=int,default=1,help="Number of GPUs to use (default: 1)")
     parser.add_argument("--batch_size",type=int,default=2,help="Batch size for training")
     parser.add_argument("--gradient_accumulation_steps",type=int,default=4,help="Number of gradient accumulation steps")
-    parser.add_argument("--learning_rate",type=float,default=2e-5,help="Learning rate")
+    parser.add_argument("--learning_rate",type=float,default=5e-5,help="Learning rate")
     parser.add_argument("--epochs",type=int,default=1,help="Number of training epochs")
     parser.add_argument("--num_labels",type=int,default=1,help="Number of labels")
     parser.add_argument("--mean_pooling",type=bool,default=False,help="Whether to use mean pooling for the last hidden state")
     parser.add_argument("--concat_layers",type = str,default="3,8,16,-1",help="Use what layers to regression")
     parser.add_argument("--use_FGM",type=bool,default=False,help="Whether to use FGM for adversarial training")
+    parser.add_argument("--use_bce",type=bool,default=False,help="Use bce with logit loss or not(default: mseloss)")
+    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--model_name_or_path", 
                         type=str, 
                         default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/model/Qwen/Qwen2.5-7B-Instruct", 
                         help="Pretrained model path")
     parser.add_argument("--train_file", type=str, 
-                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/train.jsonl", 
+                        default= "/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/dataset/processed/train.jsonl", 
                         help="Path to training file")
     parser.add_argument("--val_file", 
                         type=str, 
@@ -40,12 +42,15 @@ def parse_args():
                         help="Path to validation file")
     parser.add_argument("--output_dir", 
                         type=str, 
-                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/ensemble/Qwen/Qwen2.5-7B-Instruct/", 
+                        default="/data/workspace/xiarui/tianchi_LMTextDetect/CCKS2025_LLM-Generated_Text_Detection/output/Qwen/Qwen2.5-7B-Instruct/finetune_lora/4layers_2dropout_3heads/", 
                         help="Directory to save model outputs")
     return parser.parse_args()
 args = parse_args()
 args.concat_layers = [int(i) for i in args.concat_layers.split(",")]  # 转换为整数列表
-
+if args.use_bce:
+    loss_fn = nn.BCEWithLogitsLoss()
+else:
+    loss_fn = nn.MSELoss()  # 使用均方误差损失函数
 
 class FGM:
     def __init__(self, model, epsilon=1.0, emb_name='word_embeddings'):
@@ -103,6 +108,7 @@ class CustomModel(nn.Module):
         self.concat_layers = concat_layers
         self.base_model = AutoModel.from_pretrained(model_name,local_files_only = True)
         self.hidden_size = self.base_model.config.hidden_size
+        ### change when using different models
         self.pad_token_id = self.base_model.config.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = self.base_model.config.bos_token_id
@@ -191,7 +197,7 @@ def evaluate(model, val_loader, writer, step):
 def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,accelerator,use_fgm,fgm=None):
     model.train()
     train_total_loss = 0
-    batches = 0
+    total_steps = 0
     for epoch in range(epochs):
         process_bar  = tqdm(data_iterator, desc=f"Epoch {epoch + 1}/{epochs}")
         for step,batch in enumerate(process_bar):
@@ -224,8 +230,15 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer, val_loader,acce
                 train_total_loss += (loss.item() + loss_adv.item())
             else:
                 train_total_loss += loss.item()
+            total_steps += 1
+            if (total_steps)%(500*args.gradient_accumulation_steps)==0:
+                val_loss = evaluate(model, val_loader, writer, (total_steps)//(500*args.gradient_accumulation_steps))
+                model.train()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
-        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/step:.4f}")
+        print(f"Train Loss after Epoch {epoch + 1}: {train_total_loss/total_steps:.4f}")
+        val_loss = evaluate(model, val_loader, writer, (total_steps)//(500*args.gradient_accumulation_steps)+1)
+        print(f"Validation Loss after Epoch {epoch + 1}: {val_loss:.4f}")
+        model.train()
         
     writer.close()  # 关闭TensorBoard记录器    
             
@@ -240,10 +253,10 @@ if __name__ == "__main__":
     model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name,local_files_only=True,trust_remote_code=True,padding_side="left")
     model = CustomModel(model_name,args.num_labels,args.mean_pooling,args.concat_layers)
-    model = model.bfloat16() # 使用bfloat16精度
+    
     lora_config = LoraConfig(
-        r= 8,  # LoRA rank
-        lora_alpha=16,  # LoRA alpha
+        r= args.lora_rank,  # LoRA rank
+        lora_alpha= args.lora_alpha,  # LoRA alpha
         target_modules=["q_proj", "v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"], # 需要应用LoRA的模块
         bias = "none",  # LoRA偏置
         lora_dropout=0.2,
@@ -251,7 +264,7 @@ if __name__ == "__main__":
     )
     print(f"Model loaded from {model_name}, Finish loading model")
     model.base_model = get_peft_model(model.base_model, lora_config)
-    
+    model = model.bfloat16() # 使用bfloat16精度
     
     print("Frozen base model parameters except LoRA layers:")
     # 冻结基础模型的参数
@@ -276,9 +289,6 @@ if __name__ == "__main__":
             add_special_tokens=True,
             max_length=1024,
             truncation=True
-            # max_length=1024, 
-            # padding="max_length",  # 使用最大长度填充
-            # truncation=True  # 截断超过最大长度的文本
         )
         return {
             "input_ids": model_input["input_ids"],
@@ -288,7 +298,7 @@ if __name__ == "__main__":
     train_dataset = train_data.map(
         map_function,
         remove_columns=["text"],  # 移除原始文本列
-        num_proc=4,  # 使用8个进程进行并行处理
+        num_proc=4,  # 使用4个进程进行并行处理
         desc="Processing train data"
     )
     
