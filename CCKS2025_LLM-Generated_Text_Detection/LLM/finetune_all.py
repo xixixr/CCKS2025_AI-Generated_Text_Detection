@@ -108,7 +108,7 @@ def train(data_iterator,model,optimizer,scheduler,epochs,writer):
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
 
-            with torch.cuda.amp.autocast():  # 使用混合精度计算
+            with torch.amp.autocast(device_type='cuda'): # 使用混合精度计算
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = F.mse_loss(logits.view(-1), labels.float().view(-1))  # 使用均方误差损失
             accelerator.backward(loss)
@@ -183,4 +183,4 @@ if __name__ == "__main__":
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), save_path + "/model.pth")
     # tokenizer.save_pretrained(save_path)
-    print(f"Model and tokenizer saved to {save_path}")
+    print(f"Model saved to {save_path}")

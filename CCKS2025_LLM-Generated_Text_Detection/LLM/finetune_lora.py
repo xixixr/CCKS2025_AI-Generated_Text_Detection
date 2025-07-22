@@ -131,13 +131,12 @@ class CustomModel(nn.Module):
 
         
         output = self.base_model(input_ids=input_ids,attention_mask=attention_mask,inputs_embeds = inputs_embeds,output_hidden_states = True)
-        hidden_states = output.hidden_states
+        hidden_states = output.hidden_states #(batch_size,seq_len,hidden_size)
         selected_states = [hidden_states[i] for i in self.concat_layers] # list consist of (batch_size,seq_len,hidden_size)
-        hidden_states = output.last_hidden_state #(batch_size,seq_len,hidden_size)
         if self.mean_pooling:
             pooled_output = []
             for hidden_states in selected_states:
-                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,hidden_size)
+                masked_hidden = hidden_states*attention_mask.unsqueeze(-1)#(batch_size,seq_len,hidden_size)
                 pooled_output.append(masked_hidden.sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)) # list of (batch_size,hidden_size)
             pooled_output = torch.cat(pooled_output,dim=-1) #(batch_size,hidden_size*len(self.concat_layers))
             logits = self.regression_head(pooled_output) #(batch_size,num_labels)
