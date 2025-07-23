@@ -15,8 +15,8 @@ CCKS2025-**大模型生成文本检测**竞赛比赛成绩：**第19名（19/109
 由于不同模型对软件安装的环境配置不同，所以针对本项目如想测试复现所有方法，建议使用conda管理环境，配置不同环境。下面将针对不同的方法说明使用说明。
 ### 1. 首先克隆仓库到本地
 ```shell
-git clone https://github.com/xixixr/tianchi_LMTextDetect.git
-cd tianchi_LMTextDetect-main
+git clone <repository url>
+cd <repository name>
 ```
 ### 2. 环境配置
 - **基于LLM方法的环境配置**
